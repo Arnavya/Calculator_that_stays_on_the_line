@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace net {
@@ -11,5 +12,11 @@ int listen_ipv4(std::uint16_t port, std::uint16_t* bound_port);
 
 // Accepts one connection, retrying on EINTR. Returns fd >= 0 or -1 on failure.
 int accept_one(int listen_fd);
+
+// Writes exactly len bytes to fd. send() is allowed to write fewer bytes than
+// requested, so this loops until everything is written, retrying on EINTR.
+// Returns true on success, false on error (including a peer that already
+// closed the connection).
+bool send_all(int fd, const char* data, std::size_t len);
 
 }  // namespace net

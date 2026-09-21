@@ -69,4 +69,23 @@ int accept_one(int listen_fd) {
     }
 }
 
+bool send_all(int fd, const char* data, std::size_t len) {
+    std::size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = ::send(fd, data + sent, len - sent, 0);
+        if (n > 0) {
+            sent += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            std::perror("send");
+        }
+        return false;
+    }
+    return true;
+}
+
 }  // namespace net
