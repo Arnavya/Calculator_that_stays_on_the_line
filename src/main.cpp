@@ -1,3 +1,4 @@
+#include "http.h"
 #include "net.h"
 
 #include <cerrno>
@@ -5,14 +6,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
 
-// STEP 2 placeholder. Framing is NOT implemented yet: this reply is sent once
-// per successful recv(), which is exactly the "one recv() == one request"
-// assumption that STEP 3 removes.
+// STEP 2/3 placeholder. Framing works; routing and the real body come later.
 const char kPlaceholderResponse[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 2\r\n"
@@ -35,15 +35,55 @@ bool parse_port(const char* text, std::uint16_t* out) {
     return true;
 }
 
-// Persistent connection loop. Stays on one socket for the life of the
-// connection: recv, reply, repeat. Only a client-side close (recv == 0) or a
-// socket error ends the loop.
+// Persistent connection loop over one socket.
+//
+// The receive buffer is the only place bytes live between recv() and the
+// parser. Each iteration first drains every request that is already complete
+// in the buffer, then blocks in recv() for more. That order is what makes
+// pipelining and "request + partial next request" work.
 int serve_connection(int conn_fd) {
-    char buf[4096];
-    int batches = 0;
+    std::string buffer;  // per-connection, persists across recv() calls
+    char chunk[4096];
+    int served = 0;
+    bool stop = false;
 
-    for (;;) {
-        ssize_t n = ::recv(conn_fd, buf, sizeof(buf), 0);
+    while (!stop) {
+        // 1) Drain every request already fully buffered. This runs before
+        //    recv() so leftover bytes from a previous recv() are never ignored.
+        for (;;) {
+            http::FramedRequest framed;
+            const http::FrameStatus status = http::take_one_request(buffer, &framed);
+
+            if (status == http::FrameStatus::kIncomplete) {
+                break;  // need more bytes
+            }
+            if (status == http::FrameStatus::kHeadTooLarge) {
+                std::printf("head exceeded %zu bytes, dropping connection\n",
+                            http::kMaxHeadBytes);
+                std::fflush(stdout);
+                stop = true;
+                break;
+            }
+
+            ++served;
+            std::printf("request #%d: %zu bytes, %zu bytes left buffered\n",
+                        served, framed.head_length, buffer.size());
+            std::fflush(stdout);
+
+            if (!net::send_all(conn_fd, kPlaceholderResponse,
+                               sizeof(kPlaceholderResponse) - 1)) {
+                stop = true;
+                break;
+            }
+        }
+
+        if (stop) {
+            break;
+        }
+
+        // 2) Ask the kernel for more bytes. Whatever arrives is appended, never
+        //    assumed to align with a request boundary.
+        const ssize_t n = ::recv(conn_fd, chunk, sizeof(chunk), 0);
 
         if (n == 0) {
             std::printf("client closed connection\n");
@@ -58,17 +98,10 @@ int serve_connection(int conn_fd) {
             break;
         }
 
-        ++batches;
-        std::printf("recv batch #%d: %zd bytes\n", batches, n);
-        std::fflush(stdout);
-
-        if (!net::send_all(conn_fd, kPlaceholderResponse,
-                           sizeof(kPlaceholderResponse) - 1)) {
-            break;
-        }
+        buffer.append(chunk, static_cast<std::size_t>(n));
     }
 
-    std::printf("served %d recv batches on one connection\n", batches);
+    std::printf("served %d requests on one connection\n", served);
     std::fflush(stdout);
     return 0;
 }
