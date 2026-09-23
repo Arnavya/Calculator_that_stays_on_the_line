@@ -12,7 +12,8 @@
 
 namespace {
 
-// STEP 2/3 placeholder. Framing works; routing and the real body come later.
+// STEP 2/3 placeholder. Framing and parsing are real now; routing and the real
+// result body arrive in STEP 6.
 const char kPlaceholderResponse[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Length: 2\r\n"
@@ -20,6 +21,23 @@ const char kPlaceholderResponse[] =
     "Connection: keep-alive\r\n"
     "\r\n"
     "ok";
+
+// Provisional response writer. STEP 5 replaces this with a dedicated module.
+bool send_text(int fd, int code, const char* reason, const std::string& body) {
+    char head[256];
+    const int n = std::snprintf(
+        head, sizeof(head),
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nContent-Type: text/plain\r\n"
+        "Connection: keep-alive\r\n\r\n",
+        code, reason, body.size());
+    if (n < 0 || static_cast<std::size_t>(n) >= sizeof(head)) {
+        return false;
+    }
+    if (!net::send_all(fd, head, static_cast<std::size_t>(n))) {
+        return false;
+    }
+    return net::send_all(fd, body.data(), body.size());
+}
 
 bool parse_port(const char* text, std::uint16_t* out) {
     if (text == nullptr || *text == '\0') {
@@ -45,29 +63,52 @@ int serve_connection(int conn_fd) {
     std::string buffer;  // per-connection, persists across recv() calls
     char chunk[4096];
     int served = 0;
+    int rejected = 0;
     bool stop = false;
 
     while (!stop) {
         // 1) Drain every request already fully buffered. This runs before
         //    recv() so leftover bytes from a previous recv() are never ignored.
         for (;;) {
-            http::FramedRequest framed;
-            const http::FrameStatus status = http::take_one_request(buffer, &framed);
+            const http::ParseResult parsed = http::take_one_request(buffer);
 
-            if (status == http::FrameStatus::kIncomplete) {
+            if (parsed.status == http::FrameStatus::kIncomplete) {
                 break;  // need more bytes
             }
-            if (status == http::FrameStatus::kHeadTooLarge) {
-                std::printf("head exceeded %zu bytes, dropping connection\n",
-                            http::kMaxHeadBytes);
+            if (parsed.status == http::FrameStatus::kHeadTooLarge) {
+                std::printf("rejecting request: %s\n",
+                            http::describe(parsed.error));
                 std::fflush(stdout);
+                send_text(conn_fd, 400, "Bad Request", "Bad Request");
                 stop = true;
                 break;
             }
 
             ++served;
-            std::printf("request #%d: %zu bytes, %zu bytes left buffered\n",
-                        served, framed.head_length, buffer.size());
+            if (parsed.error != http::ParseError::kNone) {
+                ++rejected;
+                std::printf("request #%d rejected: %s\n", served,
+                            http::describe(parsed.error));
+                std::fflush(stdout);
+                if (!send_text(conn_fd, 400, "Bad Request", "Bad Request")) {
+                    stop = true;
+                    break;
+                }
+                // A broken head still has a known boundary, so the next request
+                // starts right after it and the connection can stay open. When
+                // the extent is unknowable the stream cannot be resynchronised,
+                // so the response goes out and then the connection closes.
+                if (parsed.framing_lost) {
+                    stop = true;
+                }
+                continue;
+            }
+
+            std::printf("request #%d: %s %s (head=%zu body=%zu, %zu left)\n",
+                        served, parsed.request.method.c_str(),
+                        parsed.request.target.c_str(),
+                        parsed.request.head_length, parsed.request.body_length,
+                        buffer.size());
             std::fflush(stdout);
 
             if (!net::send_all(conn_fd, kPlaceholderResponse,
@@ -101,7 +142,8 @@ int serve_connection(int conn_fd) {
         buffer.append(chunk, static_cast<std::size_t>(n));
     }
 
-    std::printf("served %d requests on one connection\n", served);
+    std::printf("served %d requests (%d rejected) on one connection\n", served,
+                rejected);
     std::fflush(stdout);
     return 0;
 }

@@ -23,8 +23,32 @@ void check(bool ok, const char* what) {
     }
 }
 
+// What goes on the wire.
 std::string req(const std::string& target) {
     return "GET " + target + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+}
+
+// What rebuild_head() produces: header names are normalised to lowercase, so
+// this is the expected round-trip form of req().
+std::string roundtripped(const std::string& target) {
+    return "GET " + target + " HTTP/1.1\r\nhost: localhost\r\n\r\n";
+}
+
+// Reconstructs the exact bytes the request occupied, so framing can be checked
+// against what was actually sent rather than against a re-serialisation.
+std::string rebuild_head(const http::ParseResult& parsed) {
+    const http::Request& r = parsed.request;
+    std::string head = r.method + " " + r.target + " " + r.version + "\r\n";
+    for (const auto& h : r.headers) {
+        head += h.first;
+        if (!h.second.empty()) {
+            head += ": " + h.second;
+        }
+        head += "\r\n";
+    }
+    head += "\r\n";
+    head += r.body;
+    return head;
 }
 
 // Feeds `data` to the framer one chunk at a time, collecting the head of every
@@ -42,12 +66,11 @@ std::vector<std::string> frame_by_chunks(const std::string& data,
 
         // Drain every request that is now complete.
         for (;;) {
-            http::FramedRequest framed;
-            const http::FrameStatus st = http::take_one_request(buffer, &framed);
-            if (st != http::FrameStatus::kComplete) {
+            const http::ParseResult st = http::take_one_request(buffer);
+            if (st.status != http::FrameStatus::kComplete) {
                 break;
             }
-            heads.push_back(framed.head);
+            heads.push_back(rebuild_head(st));
         }
     }
 
@@ -65,22 +88,27 @@ void expect_incomplete_then_complete() {
     std::printf("A. fragmented request across recv()\n");
 
     std::string buffer;
-    http::FramedRequest framed;
+    http::ParseResult parsed;
 
     buffer.append("GET /add?a=2&b=3 HT");
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kIncomplete,
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kIncomplete,
           "partial request line must report incomplete");
     check(buffer == "GET /add?a=2&b=3 HT", "buffer untouched while incomplete");
 
     buffer.append("TP/1.1\r\nHost: localhost\r\n");
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kIncomplete,
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kIncomplete,
           "headers not terminated yet");
 
     buffer.append("\r\n");
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kComplete,
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kComplete,
           "complete once CRLFCRLF arrives");
-    check(framed.head == req("/add?a=2&b=3"), "head bytes exact");
-    check(framed.head_length == req("/add?a=2&b=3").size(), "consumed length exact");
+    check(parsed.error == http::ParseError::kNone, "no parse error");
+    check(rebuild_head(parsed) == roundtripped("/add?a=2&b=3"), "head bytes exact");
+    check(parsed.request.head_length == req("/add?a=2&b=3").size(),
+          "consumed length exact");
     check(buffer.empty(), "buffer empty after single request");
 }
 
@@ -90,16 +118,19 @@ void expect_terminator_split_across_chunks() {
     const std::string full = req("/sub?a=1&b=1");
     for (std::size_t split = 1; split < full.size(); ++split) {
         std::string buffer;
-        http::FramedRequest framed;
+        http::ParseResult parsed;
 
         buffer.append(full, 0, split);
-        check(http::take_one_request(buffer, &framed) == http::FrameStatus::kIncomplete,
+        parsed = http::take_one_request(buffer);
+        check(parsed.status == http::FrameStatus::kIncomplete,
               "incomplete before terminator is fully buffered");
 
         buffer.append(full, split, std::string::npos);
-        check(http::take_one_request(buffer, &framed) == http::FrameStatus::kComplete,
+        parsed = http::take_one_request(buffer);
+        check(parsed.status == http::FrameStatus::kComplete,
               "complete once remaining bytes arrive");
-        check(framed.head == full, "reassembled head is byte-identical");
+        check(rebuild_head(parsed) == roundtripped("/sub?a=1&b=1"),
+              "reassembled head is byte-identical");
         check(buffer.empty(), "buffer drained");
     }
 }
@@ -111,16 +142,19 @@ void expect_two_requests_one_buffer() {
     const std::string r2 = req("/mul?a=6&b=7");
 
     std::string buffer = r1 + r2;
-    http::FramedRequest framed;
+    http::ParseResult parsed;
 
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kComplete,
-          "first request framed");
-    check(framed.head == r1, "first request is the first one");
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kComplete, "first request framed");
+    check(rebuild_head(parsed) == roundtripped("/add?a=2&b=3"),
+          "first request is the first one");
     check(buffer == r2, "second request preserved verbatim in buffer");
 
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kComplete,
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kComplete,
           "second request framed from leftover bytes alone");
-    check(framed.head == r2, "second request intact");
+    check(rebuild_head(parsed) == roundtripped("/mul?a=6&b=7"),
+          "second request intact");
     check(buffer.empty(), "buffer drained after both");
 }
 
@@ -132,13 +166,15 @@ void expect_request_plus_partial_next() {
     const std::string half = r2.substr(0, r2.size() / 2);
 
     std::string buffer = r1 + half;
-    http::FramedRequest framed;
+    http::ParseResult parsed;
 
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kComplete,
-          "first request framed");
-    check(framed.head == r1, "first request is exact");
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kComplete, "first request framed");
+    check(rebuild_head(parsed) == roundtripped("/add?a=2&b=3"),
+          "first request is exact");
     check(buffer == half, "partial next request preserved byte-for-byte");
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kIncomplete,
+    parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kIncomplete,
           "partial next request is not a request yet");
     check(buffer == half, "still untouched after incomplete");
 }
@@ -151,7 +187,7 @@ void expect_pipelined_many() {
     const char* targets[] = {"/add?a=1&b=1", "/sub?a=2&b=2", "/mul?a=3&b=3",
                              "/div?a=9&b=3", "/add?a=4&b=4", "/sub?a=5&b=5"};
     for (const char* t : targets) {
-        expected.push_back(req(t));
+        expected.push_back(roundtripped(t));
         all += req(t);
     }
 
@@ -212,21 +248,22 @@ void expect_no_bytes_lost() {
         buffer.append(all, offset, n);
         offset += n;
         for (;;) {
-            http::FramedRequest framed;
-            if (http::take_one_request(buffer, &framed) != http::FrameStatus::kComplete) {
+            const http::ParseResult parsed = http::take_one_request(buffer);
+            if (parsed.status != http::FrameStatus::kComplete) {
                 break;
             }
-            heads.push_back(framed.head);
-            consumed += framed.head_length;
+            heads.push_back(rebuild_head(parsed));
+            consumed += parsed.request.head_length + parsed.request.body_length;
         }
     }
 
     check(heads.size() == 20, "all 20 requests recovered");
     check(consumed == total, "consumed byte count equals bytes sent");
     check(buffer.empty(), "nothing left over");
+    check(heads.size() == 20, "all 20 requests recovered (dup check)");
     bool all_same = true;
     for (const std::string& h : heads) {
-        if (h != req("/add?a=1&b=2")) {
+        if (h != roundtripped("/add?a=1&b=2")) {
             all_same = false;
         }
     }
@@ -237,21 +274,21 @@ void expect_head_too_large() {
     std::printf("F. oversized head cannot grow the buffer forever\n");
 
     std::string buffer(http::kMaxHeadBytes + 1, 'A');  // no CRLFCRLF anywhere
-    http::FramedRequest framed;
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kHeadTooLarge,
+    http::ParseResult parsed = http::take_one_request(buffer);
+    check(parsed.status == http::FrameStatus::kHeadTooLarge,
           "reports kHeadTooLarge instead of buffering forever");
+    check(parsed.framing_lost, "head-too-large means framing is lost");
 
     // At the cap exactly, it is merely incomplete.
     std::string small(http::kMaxHeadBytes, 'A');
-    check(http::take_one_request(small, &framed) == http::FrameStatus::kIncomplete,
+    check(http::take_one_request(small).status == http::FrameStatus::kIncomplete,
           "exactly at the cap is still just incomplete");
 }
 
 void expect_empty_buffer() {
     std::printf("G. empty buffer\n");
     std::string buffer;
-    http::FramedRequest framed;
-    check(http::take_one_request(buffer, &framed) == http::FrameStatus::kIncomplete,
+    check(http::take_one_request(buffer).status == http::FrameStatus::kIncomplete,
           "empty buffer is incomplete");
     check(buffer.empty(), "buffer still empty");
 }
