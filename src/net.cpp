@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <netinet/in.h>
@@ -68,6 +69,8 @@ int accept_one(int listen_fd) {
         return -1;
     }
 }
+
+void ignore_sigpipe() { ::signal(SIGPIPE, SIG_IGN); }
 
 bool send_all(int fd, const char* data, std::size_t len) {
     std::size_t sent = 0;

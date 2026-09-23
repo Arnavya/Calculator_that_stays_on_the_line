@@ -19,4 +19,10 @@ int accept_one(int listen_fd);
 // closed the connection).
 bool send_all(int fd, const char* data, std::size_t len);
 
+// Writing to a socket whose peer has gone away raises SIGPIPE, whose default
+// action is to kill the process. Call this once at startup so that instead the
+// write returns EPIPE and the connection can be dropped cleanly. Required by
+// any process that calls send_all().
+void ignore_sigpipe();
+
 }  // namespace net

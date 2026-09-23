@@ -1,8 +1,8 @@
 #include "http.h"
 #include "net.h"
+#include "response.h"
 
 #include <cerrno>
-#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -12,31 +12,21 @@
 
 namespace {
 
-// STEP 2/3 placeholder. Framing and parsing are real now; routing and the real
-// result body arrive in STEP 6.
-const char kPlaceholderResponse[] =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Length: 2\r\n"
-    "Content-Type: text/plain\r\n"
-    "Connection: keep-alive\r\n"
-    "\r\n"
-    "ok";
+// Builds the response for a request that parsed cleanly. STEP 6 replaces this
+// body with routing and arithmetic; the seam is deliberate.
+http::Response build_response(const http::Request& request) {
+    (void)request;
+    http::Response response;
+    response.status_code = http::kStatusOk;
+    response.body = "ok";
+    return response;
+}
 
-// Provisional response writer. STEP 5 replaces this with a dedicated module.
-bool send_text(int fd, int code, const char* reason, const std::string& body) {
-    char head[256];
-    const int n = std::snprintf(
-        head, sizeof(head),
-        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nContent-Type: text/plain\r\n"
-        "Connection: keep-alive\r\n\r\n",
-        code, reason, body.size());
-    if (n < 0 || static_cast<std::size_t>(n) >= sizeof(head)) {
-        return false;
-    }
-    if (!net::send_all(fd, head, static_cast<std::size_t>(n))) {
-        return false;
-    }
-    return net::send_all(fd, body.data(), body.size());
+http::Response bad_request(const char* detail) {
+    http::Response response;
+    response.status_code = http::kStatusBadRequest;
+    response.body = std::string("Bad Request: ") + detail;
+    return response;
 }
 
 bool parse_port(const char* text, std::uint16_t* out) {
@@ -79,43 +69,46 @@ int serve_connection(int conn_fd) {
                 std::printf("rejecting request: %s\n",
                             http::describe(parsed.error));
                 std::fflush(stdout);
-                send_text(conn_fd, 400, "Bad Request", "Bad Request");
+                http::Response response = bad_request(http::describe(parsed.error));
+                response.close_after = true;
+                // The full response goes out first; only then do we stop.
+                http::send_response(conn_fd, response);
                 stop = true;
                 break;
             }
 
             ++served;
+
+            // A broken head still has a known boundary, so the next request
+            // starts right after it and the connection can stay open. When the
+            // extent is unknowable the stream cannot be resynchronised, so the
+            // response goes out and only then does the connection close.
+            http::Response response;
             if (parsed.error != http::ParseError::kNone) {
                 ++rejected;
                 std::printf("request #%d rejected: %s\n", served,
                             http::describe(parsed.error));
-                std::fflush(stdout);
-                if (!send_text(conn_fd, 400, "Bad Request", "Bad Request")) {
-                    stop = true;
-                    break;
-                }
-                // A broken head still has a known boundary, so the next request
-                // starts right after it and the connection can stay open. When
-                // the extent is unknowable the stream cannot be resynchronised,
-                // so the response goes out and then the connection closes.
-                if (parsed.framing_lost) {
-                    stop = true;
-                }
-                continue;
+                response = bad_request(http::describe(parsed.error));
+                response.close_after = parsed.framing_lost;
+            } else {
+                std::printf("request #%d: %s %s (head=%zu body=%zu, %zu left)\n",
+                            served, parsed.request.method.c_str(),
+                            parsed.request.target.c_str(),
+                            parsed.request.head_length, parsed.request.body_length,
+                            buffer.size());
+                response = build_response(parsed.request);
             }
-
-            std::printf("request #%d: %s %s (head=%zu body=%zu, %zu left)\n",
-                        served, parsed.request.method.c_str(),
-                        parsed.request.target.c_str(),
-                        parsed.request.head_length, parsed.request.body_length,
-                        buffer.size());
             std::fflush(stdout);
 
-            if (!net::send_all(conn_fd, kPlaceholderResponse,
-                               sizeof(kPlaceholderResponse) - 1)) {
-                stop = true;
+            if (!http::send_response(conn_fd, response)) {
+                stop = true;  // peer vanished mid-response
                 break;
             }
+            if (response.close_after) {
+                std::printf("closing after response (Connection: close)\n");
+                stop = true;
+            }
+
         }
 
         if (stop) {
@@ -153,7 +146,7 @@ int serve_connection(int conn_fd) {
 int main(int argc, char** argv) {
     // A client may disconnect at any point; writing to that socket must return
     // an error, not kill the process.
-    ::signal(SIGPIPE, SIG_IGN);
+    net::ignore_sigpipe();
 
     const char* port_arg = (argc > 1) ? argv[1] : "8080";
 
