@@ -15,7 +15,7 @@ TEST_OBJS := $(patsubst tests/%.cpp,$(BUILD_DIR)/test_%.o,$(TEST_SRCS))
 TEST_DEPS := $(TEST_OBJS:.o=.d)
 TEST_TARGETS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%,$(TEST_SRCS))
 
-.PHONY: all test clean
+.PHONY: all test unit-test integration-test clean
 .SECONDARY:
 
 all: $(TARGET)
@@ -33,8 +33,13 @@ $(BUILD_DIR)/test_%.o: tests/%.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/%: $(BUILD_DIR)/test_%.o $(filter-out $(BUILD_DIR)/main.o,$(OBJS))
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test: $(TEST_TARGETS)
+unit-test: $(TEST_TARGETS)
 	@for t in $(TEST_TARGETS); do echo "== $$t"; ./$$t || exit 1; done
+
+integration-test: $(TARGET)
+	@python3 tests/integration_test.py
+
+test: unit-test integration-test
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
