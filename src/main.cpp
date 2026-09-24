@@ -1,3 +1,4 @@
+#include "calculator.h"
 #include "http.h"
 #include "net.h"
 #include "response.h"
@@ -11,16 +12,6 @@
 #include <unistd.h>
 
 namespace {
-
-// Builds the response for a request that parsed cleanly. STEP 6 replaces this
-// body with routing and arithmetic; the seam is deliberate.
-http::Response build_response(const http::Request& request) {
-    (void)request;
-    http::Response response;
-    response.status_code = http::kStatusOk;
-    response.body = "ok";
-    return response;
-}
 
 http::Response bad_request(const char* detail) {
     http::Response response;
@@ -96,7 +87,7 @@ int serve_connection(int conn_fd) {
                             parsed.request.target.c_str(),
                             parsed.request.head_length, parsed.request.body_length,
                             buffer.size());
-                response = build_response(parsed.request);
+                response = calc::handle(parsed.request);
             }
             std::fflush(stdout);
 
