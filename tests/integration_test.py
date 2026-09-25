@@ -137,14 +137,19 @@ class Connection:
         body, self.buffer = self.buffer[:length], self.buffer[length:]
         return status, body, headers
 
-    def expect(self, raw, status, body, label):
-        self.send(raw)
+    def receive(self, status, body, label):
+        """Reads one already-pending response and checks it."""
         got_status, got_body, headers = self.read_response(label)
         check_eq(got_status, status, "%s -> status" % label)
         if body is not None:
             check_eq(got_body, body, "%s -> body" % label)
         check_eq(headers.get(b"content-type"), b"text/plain", "%s -> Content-Type" % label)
         return got_status, got_body
+
+    def expect(self, raw, status, body, label):
+        """Sends one request, then reads and checks its response."""
+        self.send(raw)
+        return self.receive(status, body, label)
 
     def assert_no_leftover_bytes(self, label):
         check_eq(self.buffer, b"", "%s -> no unparsed bytes left in the stream" % label)
@@ -181,6 +186,75 @@ REQUIRED_MATRIX = [
     ("/div?a=1&b=0", 400, None),
     ("/pow?a=2&b=8", 404, None),
 ]
+
+
+# The six requests from the required matrix, reused for the pipelining test.
+PIPELINE_MATRIX = [
+    ("/add?a=2&b=3", 200, b"5"),
+    ("/sub?a=10&b=4", 200, b"6"),
+    ("/mul?a=6&b=7", 200, b"42"),
+    ("/div?a=9&b=3", 200, b"3"),
+    ("/div?a=1&b=0", 400, None),
+    ("/pow?a=2&b=8", 404, None),
+]
+
+
+def test_pipelining(conn):
+    """All six requests written in one send(), with no waiting in between.
+
+    This is the receive-buffer invariant. If the parser consumed the wrong
+    number of bytes, merged two requests, or skipped one, the responses would
+    come back out of order or not at all.
+    """
+    print("6. six pipelined requests, written in a single send()")
+    conn.send("".join(get(target) for target, _, _ in PIPELINE_MATRIX))
+    for target, status, body in PIPELINE_MATRIX:
+        conn.receive(status, body, "pipelined GET %s" % target)
+    conn.assert_no_leftover_bytes("after the six pipelined responses")
+    check(conn.assert_still_open("connection open after pipelining"),
+          "connection stays open after a pipelined batch")
+    print("   6 responses in request order, 0 stray bytes     OK")
+
+
+def test_pipelined_batch_of_50(conn):
+    """A larger batch, to catch ordering bugs that six requests might hide."""
+    print("7. fifty pipelined requests in a single send()")
+    batch = [("/add?a=%d&b=%d" % (i, i), 200, str(2 * i).encode()) for i in range(50)]
+    conn.send("".join(get(target) for target, _, _ in batch))
+    for target, status, body in batch:
+        conn.receive(status, body, "pipelined #%s" % target)
+    conn.assert_no_leftover_bytes("after the 50 pipelined responses")
+    print("   50 responses, correct order, no request skipped   OK")
+
+
+def test_pipelined_with_body(conn):
+    """A pipelined batch containing a request that carries a body.
+
+    The strongest desync check available: the body is announced by
+    Content-Length, and the request after it can only parse if exactly the
+    right number of body bytes was consumed.
+    """
+    print("8. a pipelined batch containing a request with a body")
+    conn.send(
+        get("/add?a=1&b=1")
+        + "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"
+        + get("/mul?a=6&b=7")
+        + get("/sub?a=10&b=4")
+    )
+    conn.receive(200, b"2", "pipelined #1 GET /add?a=1&b=1")
+    conn.receive(405, None, "pipelined #2 POST /x with a 5-byte body")
+    conn.receive(200, b"42", "pipelined #3 GET /mul?a=6&b=7")
+    conn.receive(200, b"6", "pipelined #4 GET /sub?a=10&b=4")
+    conn.assert_no_leftover_bytes("after the batch containing a body")
+    print("   body consumed exactly, later requests intact      OK")
+
+
+def test_usable_after_pipelining(conn):
+    print("9. the connection is reusable after every pipelined batch")
+    conn.expect(get("/div?a=9&b=3"), 200, b"3", "GET /div?a=9&b=3 (after pipelining)")
+    check(conn.assert_still_open("connection open at end of test"),
+          "connection still open after pipelined batches")
+    print("   further requests answered on the same socket       OK")
 
 
 def test_required_matrix(conn):
@@ -236,6 +310,10 @@ def main():
         test_method_not_allowed(conn)
         test_missing_host(conn)
         test_still_usable_at_the_end(conn)
+        test_pipelining(conn)
+        test_pipelined_batch_of_50(conn)
+        test_pipelined_with_body(conn)
+        test_usable_after_pipelining(conn)
     except Failure as failure:
         print("\nFATAL: %s" % failure)
         _failures.append(("fatal", str(failure)))
