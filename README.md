@@ -65,10 +65,11 @@ internals, described under [Request framing](#request-framing) below.
 ## Test
 
 ```sh
-make test                   # unit + integration + edge-case tests
+make test                   # unit + integration + edge-case + shutdown tests
 make unit-test              # C++ unit tests only
 make integration-test       # Python socket-level integration test only
 make edge-integration-test  # Python malformed-input / error-path test only
+make shutdown-test          # Python SIGINT / SIGTERM test only
 
 make sanitize          # full suite under AddressSanitizer + UndefinedBehaviorSanitizer
 make harden            # full suite under libc++ container hardening
@@ -87,8 +88,9 @@ directory first because `make` does not track `CXXFLAGS` changes. Use
 `make sanitize SANITIZERS=undefined` to run UBSan alone where the ASan runtime
 cannot initialise.
 
-Current totals: **2 238 assertions, 0 failures** — 1 928 across the six C++
-unit test binaries, 220 in the integration test, 90 in the edge-case test.
+Current totals: **2 282 assertions, 0 failures** — 1 928 across the six C++
+unit test binaries, 220 in the integration test, 90 in the edge-case test,
+44 in the shutdown test.
 
 | Test binary | Covers |
 | --- | --- |
@@ -100,6 +102,7 @@ unit test binaries, 220 in the integration test, 90 in the edge-case test.
 | `build/edge_test` | parser boundaries: truncated request line/headers, incomplete bodies left buffered, the 64 KiB head cap, the 1 MiB body cap, `Expect: 100-continue`, reassembly at every split point |
 | `tests/integration_test.py` | one real connection: required matrix, keep-alive, 405, missing `Host`, pipelining (6 and 50 requests, and a batch containing a request body) |
 | `tests/edge_integration_test.py` | malformed input over real sockets: 15 keep-alive error responses on one connection, a trickled request, a late body, `Expect: 100-continue`, an incomplete request abandoned by the client, an unterminated oversized head, an over-cap `Content-Length`, five untrustworthy `Content-Length` values, and `Transfer-Encoding` |
+| `tests/shutdown_test.py` | SIGINT and SIGTERM while blocked in `accept()` and in `recv()`, the shutdown statistics, immediate port reuse, and that a vanished client never kills the process with `SIGPIPE` |
 
 The two Python tests split by connection lifetime. `integration_test.py` holds a
 single connection open for the whole run, which is what makes the pipelining
@@ -315,12 +318,48 @@ and a batch with a request body in the middle.
 The reverse also matters: a client may send part of a request and pause. The
 server waits, buffer intact, until the rest arrives.
 
+## Graceful shutdown
+
+`SIGINT` (Ctrl-C) and `SIGTERM` both stop the server cleanly: it stops
+accepting, releases the listening socket and the client connection, prints what
+it did, and exits `0`.
+
+```
+connections accepted: 1
+requests processed:   6 (1 malformed)
+responses sent:       6
+clean shutdown
+```
+
+`malformed` counts requests the HTTP layer refused. A `404` or `405` is a
+well-formed request answered with an error, so it counts as processed.
+
+The interesting part is *how* the signal is noticed. The server spends nearly
+all its life parked inside a blocking syscall — `accept()` before anyone
+connects, `recv()` on an idle connection — where it is not executing any code
+of its own and cannot check a flag. Three rules make that work:
+
+1. **The handler does almost nothing.** It sets a `volatile sig_atomic_t` and
+   `write()`s one byte to a self-pipe. Those are the only two things a handler
+   may portably do. No closing, no printing, no allocation happens in it.
+2. **The byte wakes the poll.** Every wait goes through
+   `net::Shutdown::wait()`, which `poll()`s the socket *and* the pipe together.
+   When the byte arrives, `poll()` returns and the loop can see the flag.
+3. **Handlers are installed without `SA_RESTART`.** A blocked syscall reports
+   `EINTR` as well, so `accept()` can notice the request instead of silently
+   resuming. `accept_one()` takes the shutdown object for exactly this: without
+   it, a signal arriving in the window between `poll()` reporting the socket
+   readable and `accept()` running would restart the wait and be lost.
+
+`SIGPIPE` is still ignored. A client that vanishes mid-response produces
+`EPIPE`, which `send_all()` reports as a normal write failure.
+
 ## Source layout
 
 | File | Responsibility |
 | --- | --- |
 | `src/main.cpp` | argument handling, accept one connection, run the persistent loop |
-| `src/net.cpp` | `listen`/`accept`/`send_all`, `SIGPIPE` suppression |
+| `src/net.cpp` | `listen`/`accept`/`send_all`, `SIGPIPE` suppression, `Shutdown` (self-pipe + signal handlers) |
 | `src/http.cpp` | the receive buffer, `take_one_request()`, request line and header parsing |
 | `src/response.cpp` | response serialisation, `Date`, write-all |
 | `src/calculator.cpp` | query parsing, integer validation, arithmetic, routing |
@@ -343,6 +382,6 @@ Deliberate scope limits, not oversights:
 - **No `Transfer-Encoding` / chunked bodies.**
 - **`Expect: 100-continue` is not implemented.**
 - **No keep-alive or read timeouts.** A client that opens a connection and goes
-  silent holds it indefinitely.
+  silent holds it indefinitely, until a signal arrives.
 - **No percent-decoding** of query values.
 - **Loopback only** — the listener is bound to `127.0.0.1`.
