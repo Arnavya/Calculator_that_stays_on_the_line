@@ -1,0 +1,975 @@
+HTTP/1.1 CALCULATOR SERVER — TECHNICAL SPECIFICATION
+===================================================
+
+Version: 1.0
+Applies to: the server binary built from this project.
+
+This document is self-contained. An implementer who has never seen this code
+should be able to build a byte-compatible server from this text alone. Every
+statement about behaviour below was verified against the running server. Where
+the server is deliberately non-conformant, the deviation is stated explicitly
+and marked DEVIATION.
+
+
+1. SCOPE
+--------
+
+1.1  What this is
+A single-purpose HTTP/1.1 server that answers arithmetic requests. It speaks
+HTTP over a raw TCP stream using POSIX sockets (socket/bind/listen/accept/
+send/recv, plus poll). It does not use any web framework, HTTP library, or
+third-party dependency of any kind. The only interface it offers is a
+listening TCP socket.
+
+1.2  What this is not
+It is not a general-purpose HTTP server. It implements a small, fixed subset of
+HTTP/1.1, chosen for one program. Anything outside that subset is rejected
+with 400 rather than being supported approximately. Specifically, there is no
+TLS, no HTTP/2, no chunked transfer coding, no compression, no content
+negotiation, no caching, no authentication, and no request forwarding.
+
+1.3  Network interface
+  * Address family: IPv4.
+  * Bind address: 127.0.0.1 (loopback) only. The server is never reachable
+    from off-host. There is no configuration for another address.
+  * Port: taken from the first command-line argument.
+      - argument absent  -> port 8080
+      - "0"              -> the kernel picks a free ephemeral port
+      - any value 1..65535 -> that exact port
+      - anything else (non-numeric, out of range, empty) is a fatal usage
+        error
+  * On startup the server prints exactly one line to stdout and flushes it:
+
+        listening on 127.0.0.1:<port>
+
+    where <port> is the port actually bound. When 0 was requested this is the
+    ephemeral port the kernel chose, which is how a test harness discovers it.
+  * A usage error prints the following to stderr and exits with status 2:
+
+        usage: <program> <port>
+
+  * Backlog: 16 pending connections.
+  * SO_REUSEADDR is set, so the port may be re-bound immediately after exit.
+
+1.4  Connection lifetime — READ THIS, IT IS UNUSUAL
+The server accepts exactly ONE TCP connection, serves it until it ends, and
+then the process exits. It is not a concurrent server: there is no thread per
+connection, no select loop over many clients, and no second connection is
+ever accepted, even if one is queued in the backlog while the first is still
+being served.
+
+Consequences a client must plan for:
+  * To talk to the server N times, start the process N times. There is no way
+    to make one process serve two sequential connections.
+  * Within that single connection there is no limit on the number of requests.
+  * A client that wants to make a second connection must wait for the process
+    to exit and start a new one.
+
+1.5  Process exit
+  * Normal end of the served connection (client closed)  -> exit status 0
+  * SIGINT or SIGTERM received                        -> exit status 0
+  * Bad command-line port                             -> exit status 2
+  * The server treats SIGPIPE as ignored. A peer that vanishes mid-response
+    must not kill the process; the write simply fails and the connection ends.
+
+
+2. SUPPORTED OPERATIONS
+-----------------------
+
+2.1  Routes and expected results
+Four operations. Each takes exactly two operands, named a and b, supplied in
+the query string, and returns the result as a decimal integer in the response
+body with status 200.
+
+    GET /add?a=<int>&b=<int>   ->  200, body = a + b
+    GET /sub?a=<int>&b=<int>   ->  200, body = a - b
+    GET /mul?a=<int>&b=<int>   ->  200, body = a * b
+    GET /div?a=<int>&b=<int>   ->  200, body = a / b
+
+    Worked examples
+      /add?a=2&b=3    -> 200  body "5"
+      /sub?a=10&b=4   -> 200  body "6"
+      /mul?a=6&b=7    -> 200  body "42"
+      /div?a=9&b=3    -> 200  body "3"
+
+2.2  Operand type
+Operands are signed 64-bit integers (the range -9223372036854775808 ..
+9223372036854775807 inclusive). The accepted literal syntax is deliberately
+narrow and is checked character by character before any numeric conversion, so
+that a permissive conversion routine cannot accept something the specification
+does not allow:
+
+    operand := [ "-" ] 1*DIGIT
+
+Therefore all of the following are REJECTED with 400:
+    ""            (empty value)          " 5"   (leading space)
+    "+5"          (leading plus)         "5 "   (trailing space)
+    "0x10"        (hexadecimal)          "5.0"  (decimal point)
+    "1e3"         (exponent)             "abc"
+    "-"           (lone minus)           "5px"
+    any value whose magnitude does not fit in a signed 64-bit integer
+
+Note that "+5" is rejected, not accepted. This is stricter than many HTTP
+clients expect; a client that URL-encodes a plus sign as %2B will get 400.
+
+2.3  Arithmetic semantics
+  * add, sub and mul are ordinary signed 64-bit arithmetic.
+  * If the mathematical result does not fit in a signed 64-bit integer, the
+    result is 400 Bad Request. The server never wraps silently and never
+    saturates. Example: /add?a=9223372036854775807&b=1 -> 400.
+  * Division is integer division truncating toward zero, matching C and most
+    other languages, NOT floor division. Examples:
+        /div?a=7&b=2    -> 200  body "3"     (not 3.5, not 4)
+        /div?a=-7&b=2   -> 200  body "-3"
+        /div?a=7&b=-2   -> 200  body "-3"
+  * Division by zero is an error, not a trap and not an exception:
+        /div?a=1&b=0    -> 400  body "Bad Request"
+  * The single division that would trap on real hardware is also an error:
+        /div?a=-9223372036854775808&b=-1  -> 400  body "Bad Request"
+
+2.4  Body of a successful response
+The decimal representation of the result and nothing else: no sign for a
+non-negative value, no leading zeros, no plus sign, no whitespace, no trailing
+newline. A result of zero is the single character "0". Because the body is
+ASCII digits only, Content-Length is always equal to the number of characters.
+
+
+3. HTTP METHODS AND ROUTES
+--------------------------
+
+3.1  Method
+GET is the only supported method. Every other method token — including HEAD,
+POST, PUT, DELETE, OPTIONS, PATCH, and any unknown token — is answered with:
+
+    405 Method Not Allowed        body "Method Not Allowed"
+
+3.2  Method is checked BEFORE the route — ORDER MATTERS
+The method check happens first, so an unsupported method on an unknown route
+still yields 405, not 404:
+
+    POST /add?a=2&b=3   -> 405   (method checked first)
+    POST /nope          -> 405   (not 404)
+    GET  /nope          -> 404   (route checked second)
+
+3.3  Route matching
+The path is the portion of the request target before the first '?' character.
+Matching is EXACT and CASE-SENSITIVE against the four names in section 2.1.
+There is no normalisation of any kind. All of these are 404:
+
+    /ADD          uppercase
+    /Add          mixed case
+    /add/         trailing slash
+    /add2         prefix
+    /             root
+    /pow          a plausible but unimplemented operation
+    add           no leading slash (also rejected as a malformed request line)
+
+3.4  Target form
+Only origin-form targets are accepted: the target must begin with '/'. Both
+"/add?a=2&b=3" and "/add" are valid targets. Absolute-form
+("GET http://host/add?a=2&b=3 HTTP/1.1") and authority-form are rejected with
+400 as a malformed request line, because this is not a proxy.
+
+3.5  Query string handling
+  * The query string is everything after the first '?', or empty if there is
+    no '?'. A target with no '?' therefore fails parameter validation (400).
+  * Parameters are separated by '&'. Each element must contain '=' to count
+    as a parameter; an element without '=' is ignored, not an error.
+  * Unrecognised parameter names are ignored, not errors. /add?a=2&b=3&c=9
+    returns 200 "5".
+  * If a parameter name repeats, the FIRST occurrence wins and later ones are
+    ignored. /add?a=1&a=2&b=3 returns 200 "4" (a=1).
+  * Parameter names are matched case-sensitively, so "A=2" is not a.
+  * Values are taken literally after '='. There is no percent-decoding, and no
+    '+'-to-space conversion. "%2B5" is the four characters %2B5 and is not an
+    integer.
+  * URI fragments are NOT handled. '#' has no special meaning, so a target of
+    "/add?a=2&b=3#x" makes the value of b the string "3#x", which is not an
+    integer, and the request is answered 400 Bad Request: invalid b.
+
+
+4. REQUEST VALIDATION
+---------------------
+
+Validation order, which is externally observable and therefore normative:
+
+    1. request line syntax
+    2. header syntax
+    3. Host present
+    4. duplicate Host / Content-Length
+    5. body extent (Content-Length / Transfer-Encoding)   [section 8]
+    6. method supported?      -> 405
+    7. route known?           -> 404
+    8. operand a valid?       -> 400 invalid a
+    9. operand b valid?       -> 400 invalid b
+   10. arithmetic possible?   -> 400
+
+A request that fails at any step produces exactly one response and no
+subsequent processing of that request.
+
+4.1  Host header is REQUIRED
+HTTP/1.1 requires exactly one Host header field. Its presence is mandatory;
+its value is not validated in any way (it may be any legal header value, an IP
+address, or a name the server never resolves).
+
+    GET /add?a=2&b=3 HTTP/1.1\r\n\r\n            -> 400
+        body: Bad Request: missing Host header
+
+Header field names are matched case-insensitively, so "host:", "Host:" and
+"HOST:" are all accepted. A request with no headers at all cannot satisfy the
+requirement and is rejected.
+
+4.2  Complete list of 400 responses
+    condition                                  status  body
+    ----------------------------------------  ------  -------------------------
+    missing Host header                        400    Bad Request: missing Host header
+    duplicate Host or Content-Length           400    Bad Request: duplicate Host or Content-Length header
+    malformed request line                     400    Bad Request: malformed request line
+    version is not exactly HTTP/1.1            400    Bad Request: unsupported HTTP version
+    malformed header                           400    Bad Request: malformed header
+    request head too large                     400    Bad Request: request head too large
+    Transfer-Encoding present                  400    Bad Request: Transfer-Encoding is not supported
+    invalid or over-limit Content-Length       400    Bad Request: invalid Content-Length
+    operand a missing or not an integer        400    Bad Request: invalid a
+    operand b missing or not an integer        400    Bad Request: invalid b
+    division by zero, or 64-bit overflow      400    Bad Request
+
+Note the two families of 400 body. Failures detected while parsing HTTP carry
+a descriptive suffix naming the exact problem. Failures detected while
+evaluating the arithmetic produce the bare body "Bad Request", because
+"division by zero" is not distinguished from "overflow" in the response.
+
+4.3  Which 400 responses keep the connection open
+This distinction is observable and clients depend on it. The rule is: if the
+server knows exactly where the next request begins, it answers 400 and keeps
+the connection open; if the byte stream can no longer be resynchronised, it
+answers 400 and stops serving that connection (see the DEVIATION below for the
+one respect in which "stops" is delayed).
+
+    KEEPS CONNECTION OPEN (stream still understood)
+      missing Host header
+      duplicate Host / duplicate Content-Length
+      malformed request line
+      unsupported HTTP version
+      malformed header
+      invalid a / invalid b
+      division by zero / overflow
+
+    CLOSES CONNECTION (stream position no longer knowable)
+      request head too large
+      Transfer-Encoding present
+      invalid or over-limit Content-Length
+
+In the closing cases the 400 response is written to the socket BEFORE the
+close, so a well-behaved client always receives the complete 400 response
+first. A client that abandons a request without reading the response may
+instead observe a connection reset.
+
+DEVIATION — extra responses after "Connection: close": in the Transfer-Encoding
+and invalid-Content-Length cases, the server stops accepting new data but
+continues to parse and answer requests that were ALREADY fully buffered when
+the error was detected, and only then closes. A client that pipelines a valid
+request behind a request rejected for either of those two reasons will receive
+the 400 followed by one further response per already-buffered request. This
+contradicts the "then close" contract and is a defect in the server, recorded
+here because it is observable. The request-head-too-large case does NOT exhibit
+this: it closes immediately after its single 400. Verified:
+
+    POST /x HTTP/1.1 / Transfer-Encoding: chunked      ->  400 Bad Request
+    GET  /add?a=2&b=3 HTTP/1.1     (pipelined behind)     200 OK
+
+A client must therefore keep reading until end of stream rather than assuming
+the response to a rejected request is the last one.
+
+
+5. PERSISTENT CONNECTIONS
+-------------------------
+
+5.1  The connection stays open
+After answering a request, the server does not close the connection. It sends
+the response and waits for more bytes on the same socket. Any number of
+requests may be issued on one connection, including requests that were never
+anticipated when the connection opened. The connection is served until one of
+the terminating conditions in section 5.4.
+
+Every response on a healthy connection carries "Connection: keep-alive",
+because the server never closes a connection that a client has not asked it to
+close, and never because of a well-formed request.
+
+5.2  Several requests arriving in one read
+A client may write several complete requests with a single write, or several
+consecutive writes that the operating system coalesces into one read. This is
+normal and must be handled correctly: the server drains every request that is
+already complete in its buffer before it waits for more bytes. Verified: 16
+back-to-back requests in one write produce 16 correct responses in order with
+zero bytes left over.
+
+5.3  One request split across several reads
+A single request may be delivered in arbitrary fragments — down to one byte at
+a time. The server must not answer, and must not discard anything, until the
+request is completely present. Verified: a request delivered one byte per
+write, with a delay between each, produces exactly one correct response.
+
+The two rules together are the whole reason a receive buffer is necessary. A
+correct implementation keeps every unconsumed byte between reads, and after
+each response still holds any bytes belonging to the next request.
+
+5.4  When the connection ends
+  * The client closes its side (or the socket reports end of stream). The
+    server prints a log line, prints a per-connection summary, and exits 0.
+  * A framing error that cannot be resynchronised (section 4.3, closing
+    cases). The 400 response is sent, then the connection closes.
+  * SIGINT or SIGTERM. Any partial request is abandoned without a response,
+    the connection closes, and the process exits 0.
+  * The peer disappears mid-response. The write fails; the server does not
+    crash and does not retry.
+
+
+6. HTTP FRAMING — THE CENTRAL REQUIREMENT
+-----------------------------------------
+
+6.1  TCP is a byte stream, and that is the whole problem
+TCP is a reliable, ordered stream of BYTES. It preserves order and nothing
+else. It has no message boundaries, no record structure, and no notion of
+"one write equals one message".
+
+A read can return one byte, half a request, one request, or six requests and
+half of a seventh. The following are all equally legal and all occur in
+practice:
+
+    - a request split at any byte position, including inside a header name,
+      inside a number, or between the CR and LF of the terminator
+    - several requests in one read
+    - one read that ends exactly at a request boundary
+    - a read that contains the last bytes of request 1 and the first bytes of
+      request 2
+
+Therefore: request boundaries MUST be derived from HTTP syntax. They must
+NEVER be inferred from read boundaries, from how many bytes were available, or
+from the peer closing the connection. Socket end-of-stream is not a message
+terminator and is not an end-of-body signal.
+
+6.2  How a request's extent is determined
+A request occupies exactly two regions, in this order:
+
+    [ request line + header block, terminated by CRLF CRLF ] [ body ]
+
+  * HEAD: extends from the first byte of the request up to and INCLUDING the
+    four-byte sequence CR LF CR LF. The first occurrence of CRLFCRLF in the
+    buffered data is the end of the head.
+  * BODY: its length is given by the Content-Length header, as a byte count.
+    No other mechanism is supported.
+  * Requests with no Content-Length have a body of length zero. Calculator
+    requests never actually use the body, but the framing logic must honour
+    Content-Length anyway, otherwise a body would be misread as the next
+    request.
+
+CRLF is exactly 0x0D 0x0A. A bare LF (0x0A) is NOT a line terminator and NOT a
+head terminator. A request written with Unix line endings is therefore never
+recognised as complete: the server sends no response at all and waits forever.
+CRLF is required.
+
+6.3  The required algorithm
+Maintain one persistent receive buffer for the life of the connection. After
+every read, and after every response, attempt to extract a request from the
+front of that buffer:
+
+  1. Search the buffer for CRLFCRLF.
+     - If absent, the head is incomplete. Leave the buffer completely
+       untouched, read more, and try again. Do not answer. Do not discard.
+  2. If CRLFCRLF is present, the head is at hand. Parse the request line and
+     the header block, and determine the body length from Content-Length.
+  3. If the head plus the announced body length is longer than what is
+     currently buffered, the request is still incomplete. Leave the buffer
+     untouched, read more, and try again. Do not answer yet, even though the
+     head is already known. This step is what makes a slow-arriving body work.
+  4. Otherwise the request is complete. Consume EXACTLY the head plus exactly
+     the announced number of body bytes — no more and no fewer.
+  5. Every byte after that point belongs to a subsequent request. Those bytes
+     must still be in the buffer, in their original order, untouched, and
+     must be parsed next without waiting for another read.
+
+The two error-handling rules that go with this:
+
+  * If a request's extent cannot be determined (unsupported transfer coding,
+    or a Content-Length that cannot be trusted), the stream cannot be
+    resynchronised: there is no way to know where the next request starts.
+    Respond 400, send "Connection: close", and stop reading from the socket.
+    Do not attempt to resynchronise by scanning for the next CRLFCRLF.
+    NOTE: this server does not abandon bytes it has already buffered — see the
+    DEVIATION note in section 4.3 — so a request that was already complete in
+    the buffer may still be answered after the 400.
+  * If a request is syntactically invalid but its extent IS known (bad
+    request line, missing Host, duplicate header, and so on), the head's byte
+    count is still known exactly, so the next request begins immediately after
+    it. Respond 400 and keep the connection open.
+
+6.4  What "consume exactly one request" means
+After processing, the buffer must begin at the first byte of the next request,
+or be empty if there is no next request. The unconsumed remainder must be
+preserved byte for byte. It is incorrect to: read a fixed-size block and treat
+it as a request; to search the stream for the next request line after an
+error; to buffer per-request instead of per-connection; or to close and
+reconnect in order to resynchronise.
+
+
+7. PIPELINING
+-------------
+
+7.1  Definition
+Pipelining means a client sends multiple complete requests back to back
+without waiting for responses. Because the connection is not closed after a
+response, several requests may be in flight at once.
+
+7.2  Required behaviour
+  * The server MUST return exactly one response for every complete request it
+    received, in the order the requests were sent.
+  * Responses MUST be written in request order, never out of order, and never
+    interleaved. A response must be written to the socket as a single
+    contiguous sequence of bytes; a response must never be split across
+    responses, and bytes of two responses must never be mixed.
+  * Because the response carries Content-Length, the client is able to
+    determine each response's end without relying on connection close. A
+    correct client must use Content-Length for this.
+  * After the last pipelined response, the connection remains open for
+    further requests.
+
+7.3  Example
+A client writes three requests in one operation:
+
+    GET /add?a=1&b=1 HTTP/1.1\r\nHost: h\r\n\r\n
+    GET /add?a=1&b=1 HTTP/1.1\r\nHost: h\r\n\r\n
+    GET /add?a=1&b=1 HTTP/1.1\r\nHost: h\r\n\r\n
+
+The server writes three responses, in order, each with Content-Length: 2 and
+body "2". No response is dropped, none is duplicated, and the client is left
+with no unconsumed bytes.
+
+7.4  Interaction with bodies
+A pipelined request that carries a body must have exactly its declared body
+consumed. The body of request 1 must never be mistaken for the start of
+request 2, and request 2's request line must not be swallowed by request 1's
+body. Verified: a batch of
+"POST /add ... Content-Length: 5 ... hello" immediately followed by
+"GET /sub?a=10&b=4 ..." in one write yields 405 for the first and 200 "6" for
+the second.
+
+
+8. REQUEST BODY AND Content-Length
+----------------------------------
+
+8.1  Why bodies exist in a bodyless server
+No supported route reads its body; /add?a=2&b=3 is answered identically whether
+or not a body is sent. Bodies must nonetheless be framed correctly, because
+otherwise body bytes would be parsed as the next request and would desynchronise
+the connection. Content-Length is therefore honoured for framing and ignored
+for semantics.
+
+8.2  Accepted syntax
+After the header value has surrounding spaces and tabs removed, Content-Length
+must consist of one or more decimal digits and nothing else, and its value
+must fit in the machine's size type. These are ACCEPTED:
+
+    Content-Length: 0
+    Content-Length: 5
+    Content-Length:  5            (surrounding whitespace is trimmed)
+
+These are REJECTED with 400 "Bad Request: invalid Content-Length", after which
+the connection is CLOSED:
+
+    Content-Length: -5            (negative)
+    Content-Length: +5            (explicit plus)
+    Content-Length: 0x10          (hexadecimal)
+    Content-Length: 5, 4          (comma-separated list of differing values)
+    Content-Length: abc           (not a number)
+    Content-Length:               (empty)
+    Content-Length: 1048577       (over the 1 MiB limit, see section 11)
+
+An over-limit Content-Length is reported as an INVALID Content-Length, not as a
+distinct "payload too large" status. There is no 413 response.
+
+8.3  Incomplete body
+If a request's head is complete but the announced body has not fully arrived,
+the server MUST NOT respond. It must wait, retain the head and the partial
+body, and answer only once the declared number of body bytes has arrived. A
+client that announces Content-Length: 5 and sends 3 bytes, then pauses, gets no
+response until the remaining 2 bytes arrive. Verified.
+
+8.4  Duplicate Content-Length
+Two Content-Length header fields in one request are rejected with 400 "Bad
+Request: duplicate Host or Content-Length header", and the connection STAYS
+OPEN, because the head's extent is still known. The same applies to two Host
+fields. Requiring a single instance removes the request-smuggling ambiguity
+that arises when duplicates disagree. Note this is a 400, not a 400-plus-close.
+
+8.5  Transfer-Encoding — NOT SUPPORTED
+If a Transfer-Encoding header field is present in ANY form, including
+"chunked" and including "identity", the request is rejected with 400 "Bad
+Request: Transfer-Encoding is not supported" and the connection is CLOSED.
+Chunked transfer coding is not implemented and will not be.
+
+  * The presence of Transfer-Encoding takes precedence over Content-Length.
+    A request carrying BOTH is answered with the Transfer-Encoding error, not
+    the Content-Length one.
+  * The connection must be closed because the body length is unknowable, so
+    there is no way to find the start of the next request.
+
+8.6  Expect: 100-continue
+An Expect header field is accepted as an ordinary header and otherwise
+ignored. The server does NOT send a "100 Continue" interim response, does not
+wait for the body, and does not reject the request. A GET carrying
+"Expect: 100-continue" is answered normally with 200. A client must not depend
+on a 100 response, and must not wait for one before sending the body.
+
+
+9. RESPONSE FORMAT
+------------------
+
+9.1  Structure
+Every response, without exception, is:
+
+    HTTP/1.1 <status> <reason>\r\n
+    Content-Length: <n>\r\n
+    Content-Type: text/plain\r\n
+    Connection: <keep-alive|close>\r\n
+    Date: <IMF-fixdate>\r\n
+    \r\n
+    <body>
+
+9.2  Field-by-field
+  * Status line: the literal "HTTP/1.1", a space, the three-digit status code,
+    a space, and a reason phrase. The server always says HTTP/1.1 in its
+    responses, even when rejecting a request that declared another version.
+  * Content-Length: REQUIRED on every response, and is the exact BYTE count of
+    the body, not a character count. A client MUST use it to find the end of
+    the body and MUST NOT use connection close for that purpose. A body
+    containing a CRLF is still framed correctly by the byte count.
+  * Content-Type: the literal "text/plain" on every response. There is no
+    charset parameter and no negotiation; a 200 body is nevertheless pure
+    ASCII digits.
+  * Connection: "keep-alive" or "close" (see section 10).
+  * Date: an IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT", always in
+    GMT. If the system clock is unavailable the Date field is omitted and the
+    rest of the response is unchanged.
+  * Header order is fixed as shown, but a client MUST parse response headers
+    by field name and MUST NOT depend on their positions.
+  * Line terminator is always CRLF, including the blank line that ends the
+    header block.
+
+9.3  Reason phrases
+    200 -> "OK"                    400 -> "Bad Request"
+    404 -> "Not Found"             405 -> "Method Not Allowed"
+Any other code would be emitted with the reason phrase "Unknown". Only the
+four codes above are ever produced by this server.
+
+9.4  Status codes produced
+    200  the arithmetic succeeded
+    400  the request could not be understood, or the arithmetic was undefined
+    404  the method was GET but the path is not a known route
+    405  the method is not GET
+No other status code is ever sent. In particular there is no 500, no 501, no
+413, and no 408: a malformed request is the client's error and is reported as
+400, never as a server fault.
+
+9.5  Worked example — 200
+Request:
+
+    GET /add?a=2&b=3 HTTP/1.1\r\n
+    Host: h\r\n
+    \r\n
+
+Response, shown as literal lines (each line ends CRLF):
+
+    HTTP/1.1 200 OK
+    Content-Length: 1
+    Content-Type: text/plain
+    Connection: keep-alive
+    Date: Sun, 06 Nov 1994 08:49:37 GMT
+    <blank line>
+    5
+
+9.6  Worked example — 400
+Request:
+
+    GET /add?a=x&b=3 HTTP/1.1\r\n
+    Host: h\r\n
+    \r\n
+
+Response:
+
+    HTTP/1.1 400 Bad Request
+    Content-Length: 22
+    Content-Type: text/plain
+    Connection: keep-alive
+    Date: Sun, 06 Nov 1994 08:49:37 GMT
+    <blank line>
+    Bad Request: invalid a
+
+The body is 22 bytes: "Bad Request: invalid a".
+
+9.7  Worked example — 404
+Request:
+
+    GET /pow?a=2&b=8 HTTP/1.1\r\n
+    Host: h\r\n
+    \r\n
+
+Response:
+
+    HTTP/1.1 404 Not Found
+    Content-Length: 9
+    Content-Type: text/plain
+    Connection: keep-alive
+    Date: Sun, 06 Nov 1994 08:49:37 GMT
+    <blank line>
+    Not Found
+
+9.8  Worked example — 405
+Request:
+
+    POST /add?a=2&b=3 HTTP/1.1\r\n
+    Host: h\r\n
+    \r\n
+
+Response:
+
+    HTTP/1.1 405 Method Not Allowed
+    Content-Length: 18
+    Content-Type: text/plain
+    Connection: keep-alive
+    Date: Sun, 06 Nov 1994 08:49:37 GMT
+    <blank line>
+    Method Not Allowed
+
+DEVIATION: RFC 9110 requires a 405 response to include an Allow header field
+listing the methods the resource supports. This server does not send one. A
+strictly conformant client must not depend on Allow being present.
+
+
+10. CONNECTION: close
+--------------------
+
+10.1  Is a client's "Connection: close" supported?  NO.
+A request header field "Connection: close" is accepted, ignored, and has NO
+effect on the server's behaviour. The request is answered normally and the
+response says "Connection: keep-alive":
+
+    GET /add?a=2&b=3 HTTP/1.1\r\n
+    Host: h\r\n
+    Connection: close\r\n
+    \r\n
+    ->  200, Content-Length: 1, Connection: keep-alive, body "5"
+
+The connection stays open and the client may send further requests. A client
+that sends "Connection: close" expecting the server to hang up will hang
+instead.
+
+10.2  When the server does send "Connection: close"
+The server sends "Connection: close" in exactly three situations, all of which
+are described elsewhere in this document:
+  * a framing error that prevents resynchronisation (section 4.3):
+    request head too large, Transfer-Encoding present, invalid or over-limit
+    Content-Length
+  * a signal (SIGINT/SIGTERM) interrupting a request that has not yet been
+    answered
+In every such case the complete response is written first and the connection is
+then closed, with the exception recorded as a DEVIATION in section 4.3: after a
+Transfer-Encoding or invalid-Content-Length rejection, any further request
+already sitting in the receive buffer is still answered before the close.
+
+10.3  How a client closes the connection
+The client closes its own side. The server then ends the connection, logs it,
+and the process exits with status 0. The client cannot ask the server to stop
+serving; it can only disconnect or signal the process.
+
+
+11. LIMITS AND MALFORMED INPUT
+------------------------------
+
+11.1  Limits
+    LIMIT                VALUE        VIOLATION -> STATUS
+    -------------------  -----------  ----------------------------
+    request head         65536 bytes  400 "Bad Request: request head too large",
+                                      then close
+    request body         1048576      400 "Bad Request: invalid Content-Length",
+                        bytes (1 MiB) then close
+
+The head limit covers the request line, all header lines, their terminating
+CRLFs, and the final blank line, i.e. everything up to and including CRLFCRLF.
+A request announcing a body larger than 1 MiB via Content-Length is rejected
+without reading the body. Exactly 1048576 is accepted; 1048577 is rejected.
+
+The head limit is enforced against the data buffered while searching for the
+end of the head. A conforming client stays well below 65536 and never observes
+the boundary's exact position; the limit is a hard cap on unterminated buffered
+data, and the rejection point can fall a few kilobytes above 65536 when the
+CRLFCRLF terminator happens to arrive in the same read. Measured: a head of
+about 60 KiB is accepted, one of about 70 KiB is rejected.
+
+There is no limit on the number of requests per connection, and no read or
+idle timeout. A client that connects and then goes silent holds the
+connection, and the process, open indefinitely until it disconnects or the
+server is signalled.
+
+11.2  Malformed request line
+The request line is: METHOD SP TARGET SP VERSION, terminated by CRLF.
+Requirements, each violation giving 400 "Bad Request: malformed request line"
+with the connection left OPEN (the head's extent is known):
+
+  * exactly two single spaces; two spaces in a row, a leading space, a
+    trailing space, or a tab separator is rejected
+  * all three fields present and non-empty
+  * METHOD consists only of RFC 9110 token characters:
+    ALPHA / DIGIT / ! # $ % & ' * + - . ^ _ ` | ~
+  * TARGET contains no space, no control character and no DEL, and begins
+    with '/' (origin-form only)
+  * VERSION must be exactly "HTTP/1.1", byte for byte, case sensitive
+    ("http/1.1" and "HTTP/1.0" are both rejected)
+
+11.3  Unsupported HTTP version
+A request line whose version is anything other than "HTTP/1.1" is rejected
+with 400 "Bad Request: unsupported HTTP version", and the connection stays
+OPEN. HTTP/1.0, HTTP/2.0 and HTTP/2 are all rejected this way; this server
+speaks no other version and performs no upgrade or negotiation. Note this is
+400, not 505.
+
+11.4  Malformed headers
+Each header line is "NAME: VALUE" with no space before the colon. Violations
+give 400 "Bad Request: malformed header", connection left OPEN:
+  * no ':' in the line
+  * empty name
+  * a character outside the token set in the name — this is what rejects the
+    obsolete "Name : value" form
+  * a control character (other than HTAB) or DEL in the value
+Surrounding spaces and tabs are trimmed from the value. A line beginning with
+a space or tab is an obsolete folded continuation line and is rejected: line
+folding is not supported.
+
+11.5  Duplicate singleton headers
+Two Host fields, or two Content-Length fields, give 400 "Bad Request: duplicate
+Host or Content-Length header" and the connection stays OPEN. Other headers
+may repeat freely and are all retained.
+
+11.6  Invalid Content-Length
+See section 8.2 for the accepted and rejected forms. All such failures close
+the connection, because the true request extent is unknowable.
+
+11.7  Truncated requests
+A request that stops part-way through its head, or whose head is complete but
+whose body is short, receives NO response. The server waits indefinitely for
+the missing bytes. There is no request timeout, so a client that sends half a
+request and stops will hold the connection open until it disconnects. A
+half-sent request is never answered with 400; it is simply not yet a request.
+
+11.8  Unknown request semantics
+Any syntactically valid GET to a path outside the four routes is 404. There is
+no default route, no index, no static file serving, and no redirect. There is
+no way to make the server perform an action other than the four operations.
+
+
+12. EXAMPLE EXCHANGES
+---------------------
+
+In every example below, "<CRLF>" marks a single CR LF pair and the blank line
+is a bare CRLF. Date values are illustrative.
+
+12.1  Normal request
+--> GET /add?a=2&b=3 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 200 OK<CRLF>
+    Content-Length: 1<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: Sun, 06 Nov 1994 08:49:37 GMT<CRLF>
+    <CRLF>
+    5
+
+12.2  Six requests on one connection, answered in order
+--> GET /add?a=2&b=3 HTTP/1.1<CRLF>      <CRLF>
+    ...
+<-- 200 "5"      (keep-alive)
+--> GET /sub?a=10&b=4 HTTP/1.1<CRLF>     <CRLF>
+<-- 200 "6"      (keep-alive)
+--> GET /mul?a=6&b=7 HTTP/1.1<CRLF>     <CRLF>
+<-- 200 "42"     (keep-alive)
+--> GET /div?a=9&b=3 HTTP/1.1<CRLF>     <CRLF>
+<-- 200 "3"      (keep-alive)
+--> GET /div?a=1&b=0 HTTP/1.1<CRLF>     <CRLF>
+<-- 400 "Bad Request"        (keep-alive)
+--> GET /add?a=2&b=3 HTTP/1.1<CRLF>     <CRLF>
+<-- 200 "5"      (keep-alive)   <- the connection is still usable
+Then the client closes; the process exits 0.
+
+12.3  Pipelined requests in a single write
+--> (one write, no waiting)
+    GET /add?a=1&b=1 HTTP/1.1<CRLF>
+    Host: h<CRLF><CRLF>
+    GET /mul?a=6&b=7 HTTP/1.1<CRLF>
+    Host: h<CRLF><CRLF>
+    GET /sub?a=10&b=4 HTTP/1.1<CRLF>
+    Host: h<CRLF><CRLF>
+<-- HTTP/1.1 200 OK ... Content-Length: 1 ... "2"
+<-- HTTP/1.1 200 OK ... Content-Length: 2 ... "42"
+<-- HTTP/1.1 200 OK ... Content-Length: 1 ... "6"
+Three responses, same order as the requests, concatenated on the wire. The
+client separates them using Content-Length, not connection close.
+
+12.4  One request split across reads
+--> GET /add?a=2   (client pauses)
+    (no response yet)
+--> b=3 HTTP/1.1   (client pauses)
+    (no response yet)
+--> Host: h<CRLF><CRLF>
+<-- HTTP/1.1 200 OK ... Content-Length: 1 ... "5"
+The server must not answer, and must not lose the partial bytes, until the
+four-byte CRLFCRLF has arrived.
+
+12.5  Request with a body, followed by a pipelined request
+--> POST /add?a=2&b=3 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    Content-Length: 5<CRLF>
+    <CRLF>
+    helloGET /add?a=40&b=2 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 405 Method Not Allowed ... "Method Not Allowed"
+<-- HTTP/1.1 200 OK ... "42"
+Exactly 5 body bytes are consumed; the second request is found intact.
+
+12.6  Invalid parameter value
+--> GET /add?a=x&b=3 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 400 Bad Request<CRLF>
+    Content-Length: 22<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Bad Request: invalid a
+
+12.7  Division by zero
+--> GET /div?a=1&b=0 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 400 Bad Request<CRLF>
+    Content-Length: 11<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Bad Request
+
+12.8  Missing Host header
+--> GET /add?a=2&b=3 HTTP/1.1<CRLF>
+    <CRLF>
+<-- HTTP/1.1 400 Bad Request<CRLF>
+    Content-Length: 32<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Bad Request: missing Host header
+
+12.9  Unsupported method
+--> POST /add?a=2&b=3 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 405 Method Not Allowed<CRLF>
+    Content-Length: 18<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Method Not Allowed
+
+12.10  Unknown route
+--> GET /pow?a=2&b=8 HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    <CRLF>
+<-- HTTP/1.1 404 Not Found<CRLF>
+    Content-Length: 9<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: keep-alive<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Not Found
+
+12.11  Transfer-Encoding, which closes the connection
+--> POST /add HTTP/1.1<CRLF>
+    Host: h<CRLF>
+    Transfer-Encoding: chunked<CRLF>
+    <CRLF>
+    0<CRLF><CRLF>
+<-- HTTP/1.1 400 Bad Request<CRLF>
+    Content-Length: 47<CRLF>
+    Content-Type: text/plain<CRLF>
+    Connection: close<CRLF>
+    Date: ...<CRLF>
+    <CRLF>
+    Bad Request: Transfer-Encoding is not supported
+
+If a complete request had been pipelined behind this one, its response (200)
+follows before the connection closes — see the DEVIATION in section 4.3.
+(end of stream)
+
+
+13. OBSERVABLE LOG OUTPUT
+------------------------
+
+stdout is line-buffered and flushed after every line. The following appear, so
+a test harness can synchronise on them. All of this is diagnostic only; no
+client-visible behaviour depends on it.
+
+    listening on 127.0.0.1:<port>     once, at startup
+    connection accepted               once, when a client connects
+    request #<n>: <METHOD> <TARGET> (head=<h> body=<b>, <r> left)
+                                      one per accepted request, where r is the
+                                      number of buffered bytes still waiting
+                                      for a later request
+    request #<n> rejected: <reason>   one per malformed request
+    closing after response (Connection: close)
+    client closed connection
+    served <n> requests (<m> rejected) on one connection
+
+When the process is ended by a signal, three summary lines are printed just
+before "clean shutdown":
+
+    connections accepted: <c>
+    requests processed:   <p> (<m> malformed)
+    responses sent:       <s>
+
+"malformed" counts requests the HTTP layer refused. A 404 or 405 is a
+well-formed request answered with an error, so it counts as processed and not
+as malformed. Every termination path ends with the line "clean shutdown".
+
+
+14. CONFORMANCE SUMMARY
+-----------------------
+
+Conformant, verified:
+  * framing derived from HTTP syntax only, never from read boundaries
+  * arbitrary request fragmentation, including one byte per read
+  * pipelining, in order, one response per request, no stray bytes
+  * exact byte-count Content-Length on every response
+  * connection reuse for an unbounded number of requests
+  * resynchronisation policy: 400 and continue when the extent is known,
+    400 and close when it is not
+  * CRLF required; a bare LF is never treated as a terminator
+
+Deliberate deviations and limitations:
+  * one connection per process; the process exits after the first client ends
+  * only GET; no chunked coding, no HTTP/1.0, no other version
+  * 405 is sent without the RFC 9110-mandated Allow header
+  * a client's "Connection: close" is ignored
+  * after a Transfer-Encoding or invalid-Content-Length rejection the server
+    keeps answering already-buffered requests before closing, so a
+    "Connection: close" response is not necessarily the last one on the wire
+  * a request head over 64 KiB and a body over 1 MiB are both reported as 400;
+    there is no 413
+  * no timeouts; a stalled client stalls the server until it disconnects
+  * "Expect: 100-continue" is ignored, and no 100 response is ever sent
+  * loopback only; there is no way to bind a routable address
+  * no percent-decoding of query values, and no URI fragment handling
+  * "+5" is rejected as a non-integer, which surprises some clients
