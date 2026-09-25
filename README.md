@@ -65,9 +65,10 @@ internals, described under [Request framing](#request-framing) below.
 ## Test
 
 ```sh
-make test              # unit tests + integration test
-make unit-test         # C++ unit tests only
-make integration-test  # Python socket-level integration test only
+make test                   # unit + integration + edge-case tests
+make unit-test              # C++ unit tests only
+make integration-test       # Python socket-level integration test only
+make edge-integration-test  # Python malformed-input / error-path test only
 
 make sanitize          # full suite under AddressSanitizer + UndefinedBehaviorSanitizer
 make harden            # full suite under libc++ container hardening
@@ -86,8 +87,8 @@ directory first because `make` does not track `CXXFLAGS` changes. Use
 `make sanitize SANITIZERS=undefined` to run UBSan alone where the ASan runtime
 cannot initialise.
 
-Current totals: **1 702 assertions, 0 failures** (1 482 in unit tests, 220 in
-the integration test).
+Current totals: **2 238 assertions, 0 failures** — 1 928 across the six C++
+unit test binaries, 220 in the integration test, 90 in the edge-case test.
 
 | Test binary | Covers |
 | --- | --- |
@@ -96,7 +97,15 @@ the integration test).
 | `build/response_test` | response serialisation, exact `Content-Length`, `Connection: close` |
 | `build/net_test` | `send_all()` short writes and error paths |
 | `build/calculator_test` | routing, integer validation, division by zero, overflow |
+| `build/edge_test` | parser boundaries: truncated request line/headers, incomplete bodies left buffered, the 64 KiB head cap, the 1 MiB body cap, `Expect: 100-continue`, reassembly at every split point |
 | `tests/integration_test.py` | one real connection: required matrix, keep-alive, 405, missing `Host`, pipelining (6 and 50 requests, and a batch containing a request body) |
+| `tests/edge_integration_test.py` | malformed input over real sockets: 15 keep-alive error responses on one connection, a trickled request, a late body, `Expect: 100-continue`, an incomplete request abandoned by the client, an unterminated oversized head, an over-cap `Content-Length`, five untrustworthy `Content-Length` values, and `Transfer-Encoding` |
+
+The two Python tests split by connection lifetime. `integration_test.py` holds a
+single connection open for the whole run, which is what makes the pipelining
+and keep-alive assertions meaningful. `edge_integration_test.py` needs a fresh
+server per scenario, because the scenarios that lose framing correctly end the
+connection and this server serves one client.
 
 ## Routes
 

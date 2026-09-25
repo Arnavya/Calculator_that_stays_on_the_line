@@ -15,7 +15,7 @@ TEST_OBJS := $(patsubst tests/%.cpp,$(BUILD_DIR)/test_%.o,$(TEST_SRCS))
 TEST_DEPS := $(TEST_OBJS:.o=.d)
 TEST_TARGETS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%,$(TEST_SRCS))
 
-.PHONY: all test unit-test integration-test sanitize harden clean
+.PHONY: all test unit-test integration-test edge-integration-test sanitize harden clean
 .SECONDARY:
 
 all: $(TARGET)
@@ -39,7 +39,10 @@ unit-test: $(TEST_TARGETS)
 integration-test: $(TARGET)
 	@python3 tests/integration_test.py $(TARGET)
 
-test: unit-test integration-test
+edge-integration-test: $(TARGET)
+	@python3 tests/edge_integration_test.py $(TARGET)
+
+test: unit-test integration-test edge-integration-test
 
 # Memory-safety / undefined-behaviour pass.
 #
