@@ -68,6 +68,9 @@ internals, described under [Request framing](#request-framing) below.
 make test              # unit tests + integration test
 make unit-test         # C++ unit tests only
 make integration-test  # Python socket-level integration test only
+
+make sanitize          # full suite under AddressSanitizer + UndefinedBehaviorSanitizer
+make harden            # full suite under libc++ container hardening
 ```
 
 `make integration-test` runs `tests/integration_test.py`, which launches
@@ -77,7 +80,13 @@ find response boundaries — it never treats connection close as an end-of-body
 signal, so a server that frames responses incorrectly fails loudly instead of
 appearing to work.
 
-Current totals: **1 701 assertions, 0 failures** (1 482 in unit tests, 219 in
+`make sanitize` and `make harden` build into separate directories so
+instrumented objects can never end up in the normal build, and each wipes its
+directory first because `make` does not track `CXXFLAGS` changes. Use
+`make sanitize SANITIZERS=undefined` to run UBSan alone where the ASan runtime
+cannot initialise.
+
+Current totals: **1 702 assertions, 0 failures** (1 482 in unit tests, 220 in
 the integration test).
 
 | Test binary | Covers |

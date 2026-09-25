@@ -18,7 +18,11 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SERVER = os.path.join(ROOT, "build", "server")
+
+# The server binary under test. Defaults to the normal build so that
+# `python3 tests/integration_test.py` keeps working on its own, but the path can
+# be overridden so the same test can be pointed at a sanitizer build instead.
+SERVER = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "server")
 
 HOST = "127.0.0.1"
 
@@ -326,6 +330,9 @@ def main():
     # One connection means the server accepted exactly one.
     check_eq(out.count("connection accepted"), 1, "server accepted exactly one connection")
     check_eq(err, "", "server wrote nothing to stderr")
+    # A sanitizer abort would show up as a non-zero exit even if it somehow left
+    # stderr empty, so the status is checked as well as the output.
+    check_eq(server.proc.returncode, 0, "server exited cleanly")
     check("clean shutdown" in out, "server shut down cleanly")
 
     print("\n%d checks, %d failures" % (_checks, len(_failures)))
